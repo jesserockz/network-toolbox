@@ -10,6 +10,18 @@ These are deliberately not Home Assistant devices. There is no `api:` and mDNS i
 off, so they stay quiet on the network under test. Firmware updates come from an
 HTTP manifest rather than from an ESPHome dashboard.
 
+## Screens
+
+| Network                                                                                                                          | Network (IPv6)                                                                                                                       |
+| -------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| <img src="static/network.png" width="320" height="240" alt="Network tab: 100M full duplex link, IPv4 addressing from the lease"> | <img src="static/network-ipv6.png" width="320" height="240" alt="Network tab: the same tab switched to IPv6, global and link-local"> |
+| Ping                                                                                                                             | Ping (after a run)                                                                                                                   |
+| <img src="static/ping.png" width="320" height="240" alt="Ping tab: idle, before either target is probed">                        | <img src="static/ping-done.png" width="320" height="240" alt="Ping tab: latency and loss to both targets after four probes">         |
+| Power                                                                                                                            | Power (PoE)                                                                                                                          |
+| <img src="static/power.png" width="320" height="240" alt="Power tab: running from USB, feeding the base">                        | <img src="static/power-poe.png" width="320" height="240" alt="Power tab: running from PoE, base on its own supply">                  |
+| System                                                                                                                           |                                                                                                                                      |
+| <img src="static/system.png" width="320" height="240" alt="System tab: uptime, MAC, firmware version and update checking">       |                                                                                                                                      |
+
 ## Devices
 
 One YAML per device at the top level, each self-contained: no packages, no
