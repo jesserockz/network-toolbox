@@ -9,3 +9,9 @@ __pycache__/
 
 # Parked configs, not part of this repo
 /local/
+
+# Local Jekyll preview of static/
+/_site/
+/.bundle/
+/vendor/
+/Gemfile.lock
