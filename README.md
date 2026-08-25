@@ -47,10 +47,18 @@ Both are local rather than pulled from GitHub:
 Unmerged ESPHome pull requests are pinned via `github://pr#`. Drop them from
 `external_components:` once they reach a release.
 
-| PR                                                      | Why it is needed                                                     |
-| ------------------------------------------------------- | -------------------------------------------------------------------- |
-| [#18530](https://github.com/esphome/esphome/pull/18530) | Adds `spi_id:` to `ethernet:`, so a W5500 can join an existing bus    |
-| [#18529](https://github.com/esphome/esphome/pull/18529) | `mipi_spi` toggles D/C inside the SPI bus lock, needed where D/C is MISO |
+| PR                                                      | Why it is needed                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------------------ |
+| [#18530](https://github.com/esphome/esphome/pull/18530) | Adds `spi_id:` to `ethernet:`, so a W5500 can join an existing bus |
+
+Because that one is still open, the builds track ESPHome **dev** rather than a
+release. Pin `esphome-version` in `.github/workflows/build.yml` back to a release
+once it lands.
+
+The companion fix for GPIO35 being both bus MISO and the LCD D/C line
+([#18529](https://github.com/esphome/esphome/pull/18529), `mipi_spi` toggling D/C
+inside the SPI bus lock) is already merged and in dev, so it no longer needs
+pinning.
 
 ## M5Stack CoreS3 with Base LAN PoE
 

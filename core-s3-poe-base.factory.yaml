@@ -292,12 +292,13 @@ update:
     update_interval: 6h
 
 external_components:
-  # Shared SPI bus for the W5500, and D/C toggled inside the bus lock.
-  # Both pending upstream; drop these two once they are in a release.
+  # Lets the W5500 share the display's SPI bus. Still pending upstream, which is
+  # why this builds against ESPHome dev; drop it once it is in a release.
+  # The companion mipi_spi fix - D/C toggled inside the bus lock, needed because
+  # GPIO35 is both bus MISO and the LCD D/C line - merged in esphome/esphome#18529
+  # and is already in dev, so it no longer needs pinning here.
   - source: github://pr#18530
     components: [ethernet, spi]
-  - source: github://pr#18529
-    components: [mipi_spi]
   # M5Stack's officially maintained AW9523B driver. Verified on hardware: the
   # register readback after boot is byte-identical to the vendored fork it replaced.
   - source: github://m5stack/esphome-yaml

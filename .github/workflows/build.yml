@@ -30,5 +30,8 @@ jobs:
       # builds are combined into a single manifest published under this name.
       # Remove combined-name to publish one manifest per file instead.
       combined-name: network-toolbox
-      esphome-version: 2026.8.1
+      # dev, not a release: the config pins esphome/esphome#18530 (spi_id on
+      # ethernet), which is not in a release yet. Pin this back to a version once
+      # that lands.
+      esphome-version: dev
       #### Modify above here to match your project ####
