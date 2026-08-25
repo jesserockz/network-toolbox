@@ -1,5 +1,11 @@
-# Gitignore settings for ESPHome
-# This is an example and may include too much for your use-case.
-# You can modify this file to suit your needs.
+# ESPHome
 /.esphome/
 /secrets.yaml
+
+# Python / uv
+.venv/
+__pycache__/
+*.pyc
+
+# Parked configs, not part of this repo
+/local/
