@@ -1,0 +1,1446 @@
+# M5Stack CoreS3 + Base LAN PoE v1.2 - network analyser
+#
+# Self-contained: no packages, no includes, no secrets.
+#
+# The LCD, the microSD slot and the M-Bus base share one SPI host with their
+# own chip selects, and the board carries 10K pull-ups (R18/R19/R21) on all
+# three nets. GPIO35 is both bus MISO and the LCD D/C line, which the display
+# drives open drain so the W5500 can still use MISO between commands.
+
+esphome:
+  name: network-toolbox
+  friendly_name: Network Toolbox
+  # `version` is rewritten by the release workflow; `dev` is what a local build gets.
+  project:
+    name: jesserockz.network-toolbox
+    version: dev
+  on_boot:
+    # Runs above setup_priority::BUS, before spi: claims GPIO35/36/37 and before
+    # ethernet: initialises the W5500.
+    - priority: 1010
+      then:
+        - lambda: |-
+            // Decide which way power crosses the M-Bus.
+            //
+            // M5GFX infers "base is unpowered" from the SPI lines being dragged below the
+            // board's pull-ups; measured false for this base - with BUS_OUT_EN and BOOST_EN
+            // confirmed low by register read-back the lines still read 111, because an
+            // unpowered W5500 does not sink them.
+            //
+            // So default to sourcing: correct on USB, fatal on PoE, and fatal is recoverable
+            // because cutting our own supply forces a cold boot. The dirty flag is written
+            // before the risky act and cleared only after surviving 15s.
+            //
+            // No self-reboot anywhere - with no battery this board does not reliably survive
+            // one, the PMU latches off (PWROFF=0x20) until the power button is pressed.
+            static ESPPreferenceObject pref_dont =
+                global_preferences->make_preference<bool>(0x5EA51E02UL);
+            static ESPPreferenceObject pref_tried =
+                global_preferences->make_preference<bool>(0x5EA51E03UL);
+            bool dont_source = false, tried = false;
+            pref_dont.load(&dont_source);
+            pref_tried.load(&tried);
+
+            if (tried) {
+              // Set before sourcing last boot and never cleared, so sourcing killed us.
+              dont_source = true;
+              bool f = false;
+              pref_dont.save(&dont_source);
+              pref_tried.save(&f);
+              global_preferences->sync();
+              ESP_LOGW("power", "Last boot died while sourcing; the base feeds us");
+            }
+
+            id(power_the_base) = !dont_source;
+            if (!dont_source) {
+              bool t = true;
+              pref_tried.save(&t);
+              global_preferences->sync();  // must reach flash before the risky write
+            }
+            ESP_LOGI("power", "M-Bus: %s",
+                     dont_source ? "not sourcing; the base has its own supply"
+                                 : "sourcing 5V to the base");
+
+            // I2C is not up this early, so bit-bang the AW9523 writes.
+            {
+              constexpr gpio_num_t SCL = GPIO_NUM_11, SDA = GPIO_NUM_12;
+              gpio_config_t bus{};
+              bus.pin_bit_mask = (1ULL << 11) | (1ULL << 12);
+              bus.mode = GPIO_MODE_INPUT_OUTPUT_OD;
+              bus.pull_up_en = GPIO_PULLUP_ENABLE;
+              bus.pull_down_en = GPIO_PULLDOWN_DISABLE;
+              bus.intr_type = GPIO_INTR_DISABLE;
+              gpio_config(&bus);
+              auto scl = [&](int v) { gpio_set_level(SCL, v); delayMicroseconds(5); };
+              auto sda = [&](int v) { gpio_set_level(SDA, v); delayMicroseconds(5); };
+              auto wr_byte = [&](uint8_t b) {
+                for (int i = 7; i >= 0; i--) { sda((b >> i) & 1); scl(1); scl(0); }
+                sda(1); scl(1); scl(0);
+              };
+              auto wr_reg = [&](uint8_t reg, uint8_t val) {
+                sda(1); scl(1); sda(0); scl(0);
+                wr_byte(0x58 << 1); wr_byte(reg); wr_byte(val);
+                sda(0); scl(1); sda(1);
+              };
+              wr_reg(0x04, 0b00011000);   // CONFIG_P0, P0.3/P0.4 inputs
+              wr_reg(0x05, 0b00001100);   // CONFIG_P1, P1.2/P1.3 inputs
+              const bool src = id(power_the_base);
+              // Boost first, unloaded, then close U14 onto the base's input capacitance so the
+              // two inrushes do not stack. No battery here, so headroom is thin.
+              wr_reg(0x03, src ? 0b10000011 : 0b00000011);  // P1.7 BOOST_EN
+              if (src)
+                delay(100);
+              wr_reg(0x02, src ? 0b00000111 : 0b00000101);  // P0.1 BUS_OUT_EN
+              if (src)
+                delay(50);  // let the rail settle before the W5500 driver looks
+            }
+    - priority: 800
+      then:
+        - lambda: |-
+            static constexpr uint8_t reg_data_array[] =
+              { 0x90, 0xBF  // LDOS ON/OFF control 0
+              , 0x92, 18 -5 // ALDO1 set to 1.8v // for AW88298
+              , 0x93, 33 -5 // ALDO2 set to 3.3v // for ES7210
+              , 0x94, 33 -5 // ALDO3 set to 3.3v // for camera
+              , 0x95, 33 -5 // ALDO3 set to 3.3v // for TF card slot
+              , 0x27, 0x00 // PowerKey Hold=1sec / PowerOff=4sec
+              , 0x69, 0x11 // CHGLED setting
+              , 0x10, 0x30 // PMU common config
+              // vsys and vbus ADCs are off by default and the Power tab needs them.
+              , 0x30, 0x0F
+              };
+
+            for (size_t i = 0; i < sizeof(reg_data_array); i+=2)
+            {
+              id(axp2101_i2c_device).reg(reg_data_array[i]) = reg_data_array[i+1];
+            }
+
+            // 0x20/0x21 latch why the PMU last came on and last shut down - the only direct
+            // evidence for the flash-once-then-die on a cold USB plug.
+            {
+              uint8_t on = 0, off = 0, vlim = 0, ilim = 0, vsysoff = 0;
+              auto &pmu = *id(axp2101_i2c_device);
+              pmu.read_byte(0x20, &on);
+              pmu.read_byte(0x21, &off);
+              pmu.read_byte(0x15, &vlim);
+              pmu.read_byte(0x16, &ilim);
+              pmu.read_byte(0x24, &vsysoff);
+              ESP_LOGI("power", "PWRON=0x%02X PWROFF=0x%02X (vsys_uv=%d sw=%d pwron_low=%d)",
+                       on, off, (off >> 3) & 1, (off >> 1) & 1, off & 1);
+              ESP_LOGI("power", "VINDPM=0x%02X Iin_limit=0x%02X Vsys_pwroff=0x%02X",
+                       vlim, ilim, vsysoff);
+            }
+        - lambda: |-
+            // AW9523 base state, same values M5GFX writes for the CoreS3: P0 is TP_RST /
+            // BUS_OUT_EN / SPK_EN, P1 is LCD_RST / BOOST_EN. Never drive P0.5 - that is
+            // USB_OTG_EN and it flips the USB mux.
+            id(aw9523_1).reg(0x04) = 0b00011000;  // CONFIG_P0: P0.3/P0.4 inputs
+            id(aw9523_1).reg(0x05) = 0b00001100;  // CONFIG_P1: P1.2/P1.3 inputs
+            id(aw9523_1).reg(0x11) = 0b00010000;  // GCR: P0 push-pull
+            id(aw9523_1).reg(0x12) = 0xFF;        // all pins GPIO mode
+            id(aw9523_1).reg(0x13) = 0xFF;
+            // Read back what the bit-banged writes did, so a failed probe can be told apart
+            // from a failed I2C write.
+            {
+              uint8_t p0 = 0xAA, p1 = 0xAA, c0 = 0xAA;
+              id(aw9523_1).read_byte(0x02, &p0);
+              id(aw9523_1).read_byte(0x03, &p1);
+              id(aw9523_1).read_byte(0x04, &c0);
+              ESP_LOGI("power", "AW9523 readback: OUT_P0=0x%02X OUT_P1=0x%02X CFG_P0=0x%02X", p0, p1, c0);
+            }
+            // Re-assert the boot decision, this time over the real I2C bus.
+            const bool src = id(power_the_base);
+            id(base_self_powered) = !src;
+            id(aw9523_1).reg(0x02) = src ? 0b00000111 : 0b00000101;
+            id(aw9523_1).reg(0x03) = src ? 0b10000011 : 0b00000011;
+            delay(100);  // let the bus 5V rail settle
+            // Hard-reset the W5500; the IDF driver only pulses the reset GPIO
+            // after the SPI soft reset already worked, so do it up front.
+            gpio_set_direction(GPIO_NUM_7, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_7, 0);
+            delayMicroseconds(1000);
+            gpio_set_level(GPIO_NUM_7, 1);
+            delay(10);
+    # At 15s, and neither path reboots: clear the dirty flag if sourcing worked, or
+    # take the base's supply over in place if it never answered. The IDF driver only
+    # pulses PHY reset after a successful SPI soft reset, so a chip dead at init
+    # stays wedged without the manual pulse and re-init below.
+    - priority: -100
+      then:
+        # Kill the tabview's swipe: a short drag snaps back and reads as being ignored.
+        # The flag lives on the content container, which content_style cannot reach.
+        - lambda: |-
+            lv_obj_remove_flag(lv_tabview_get_content(id(tabs)), LV_OBJ_FLAG_SCROLLABLE);
+        - delay: 15s
+        - if:
+            condition:
+              lambda: 'return id(power_the_base);'
+            then:
+              - lambda: |-
+                  static ESPPreferenceObject pref_tried =
+                      global_preferences->make_preference<bool>(0x5EA51E03UL);
+                  bool f = false;
+                  pref_tried.save(&f);
+                  global_preferences->sync();
+            else:
+              - if:
+                  condition:
+                    lambda: |-
+                      auto *eth = ethernet::global_eth_component;
+                      if (eth == nullptr || eth->is_failed())
+                        return true;
+                      auto *nif = eth->get_esp_netif();
+                      return nif == nullptr || !esp_netif_is_netif_up(nif);
+                  then:
+                    - lambda: |-
+                        ESP_LOGW("power", "Base never answered; taking over its 5V supply in place");
+                        static ESPPreferenceObject pref_dont =
+                            global_preferences->make_preference<bool>(0x5EA51E02UL);
+                        bool f = false;
+                        pref_dont.save(&f);
+                        global_preferences->sync();
+                        id(power_the_base) = true;
+                        id(base_self_powered) = false;
+                        id(aw9523_1).reg(0x03) = 0b10000011;  // BOOST_EN first
+                        delay(100);
+                        id(aw9523_1).reg(0x02) = 0b00000111;  // then BUS_OUT_EN
+                        delay(100);
+                        gpio_set_direction(GPIO_NUM_7, GPIO_MODE_OUTPUT);
+                        gpio_set_level(GPIO_NUM_7, 0);
+                        delayMicroseconds(1000);
+                        gpio_set_level(GPIO_NUM_7, 1);
+                    - delay: 100ms
+                    - ethernet.disable
+                    - delay: 500ms
+                    - ethernet.enable
+
+globals:
+  # True when we are sourcing 5V to the base. Decided at boot, priority 1010.
+  - id: power_the_base
+    type: bool
+    restore_value: false
+    initial_value: 'true'
+
+  # Whether the base runs on its own supply. Seeded at boot, then re-derived on
+  # every link change by the watcher in `interval:`.
+  - id: base_self_powered
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+  # Continuous ping target: 0 none, 1 internet, 2 gateway. Only one runs at a
+  # time - the pinger refuses a second batch while one is in flight.
+  - id: ping_mode
+    type: int
+    restore_value: false
+    initial_value: '0'
+  # Running totals for the continuous ping, zeroed when one is started.
+  - id: pf_sent
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pf_recv
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pf_total_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+
+  # Last seen link and lease, so the watcher fires on edges only.
+  - id: link_was_up
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: lease_was_held
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+esp32:
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+  toolchain: esp-idf
+
+logger:
+
+# No api: and no mdns: this is a bench tester and stays quiet on the network.
+mdns:
+  disabled: true
+
+network:
+  enable_ipv6: true
+
+# Updates come from an HTTP manifest, not a dashboard. The .invalid URL never
+# resolves, so a check fails cleanly. Point it at a real one when there is one.
+
+http_request:
+  verify_ssl: false
+
+ota:
+  - platform: http_request
+
+update:
+  - platform: http_request
+    id: fw_update
+    name: Firmware
+    source: https://jesserockz.github.io/network-toolbox/firmware/network-toolbox.manifest.json
+    # The System tab toggle suspends and resumes this poller.
+    update_interval: 6h
+
+external_components:
+  # Lets the W5500 share the display's SPI bus. Still pending upstream, which is
+  # why this builds against ESPHome dev; drop it once it is in a release.
+  # The companion mipi_spi fix - D/C toggled inside the bus lock, needed because
+  # GPIO35 is both bus MISO and the LCD D/C line - merged in esphome/esphome#18529
+  # and is already in dev, so it no longer needs pinning here.
+  - source: github://pr#18530
+    components: [ethernet, spi]
+  # M5Stack's officially maintained AW9523B driver. Verified on hardware: the
+  # register readback after boot is byte-identical to the vendored fork it replaced.
+  - source: github://m5stack/esphome-yaml
+    components: [aw9523b]
+  # ESPHome has no ping component; this one wraps ESP-IDF's own esp_ping and
+  # exposes it as a `ping.ping` action.
+  - source:
+      type: local
+      path: components
+    components: [ping]
+
+# ---------------------------------------------------------------------------
+# Buses
+# ---------------------------------------------------------------------------
+
+i2c:
+  - id: bus_a
+    sda: GPIO12
+    scl: GPIO11
+
+spi:
+  - id: spi_bus
+    interface: spi2
+    clk_pin: GPIO36
+    mosi_pin: GPIO37
+    miso_pin:
+      number: GPIO35
+      allow_other_uses: true
+
+# W5500 on the Base LAN PoE, sharing the CoreS3 SPI bus with the display
+ethernet:
+  type: W5500
+  spi_id: spi_bus
+  cs_pin: GPIO9
+  reset_pin: GPIO7
+  interrupt_pin: GPIO14
+  clock_speed: 20MHz
+
+# ---------------------------------------------------------------------------
+# Power, display, touch
+# ---------------------------------------------------------------------------
+
+aw9523b:
+  id: aw9523_1
+  address: 0x58
+  # Do NOT let the component software-reset the chip: priority 1010 has already
+  # set the M-Bus power direction (BUS_OUT_EN/BOOST_EN) by this point, and a
+  # reset would wipe it and could cut our own supply on PoE. With reset off the
+  # component only reads the output/config/LED registers and writes GCR.
+  reset: false
+  # P0 push-pull, to match the GCR value the priority-800 lambda writes.
+  p0_drive_mode: PUSH_PULL
+
+i2c_device:
+  - id: axp2101_i2c_device
+    address: 0x34
+    i2c_id: bus_a
+
+display:
+  - platform: mipi_spi
+    id: lcd
+    model: m5core
+    spi_id: spi_bus
+    invert_colors: true
+    cs_pin: GPIO3
+    dc_pin:
+      # GPIO35 is also bus MISO; open drain releases it to the board pull-up
+      # between commands so the host can still sample MISO
+      number: GPIO35
+      allow_other_uses: true
+      mode: {input: true, output: true, open_drain: true}
+    reset_pin:
+      # P1.1 = pin 9 in the AW9523B's flat 0-15 numbering (P0.0-P0.7 = 0-7,
+      # P1.0-P1.7 = 8-15).
+      aw9523b_id: aw9523_1
+      number: 9
+
+touchscreen:
+  - platform: ft63x6
+    id: touch
+    # No reset_pin on purpose: ft63x6's hard_reset_() reads the chip id 10ms after
+    # reset, too soon here, and on_boot has already released TP_RST.
+
+# ---------------------------------------------------------------------------
+# Data sources
+# ---------------------------------------------------------------------------
+
+ping:
+  - id: pinger
+
+text_sensor:
+  - platform: ethernet_info
+    ip_address:
+      id: eth_ip
+      name: IP address
+      on_value:
+        - lvgl.label.update:
+            id: lbl_ip
+            text: !lambda 'return x.empty() ? std::string("-") : x;'
+      # IPv4 is index 0 and IPv6 fills from 1. Which v6 address is global and which is
+      # link-local is only knowable at runtime, so route on the fe80 prefix.
+      address_1:
+        name: IPv6 address 1
+        on_value: &route_ipv6
+          - if:
+              condition:
+                lambda: 'return x.rfind("fe80", 0) == 0;'
+              then:
+                - lvgl.label.update:
+                    id: lbl_ipv6_ll
+                    text: !lambda 'return x;'
+              else:
+                - lvgl.label.update:
+                    id: lbl_ipv6_global
+                    text: !lambda 'return x;'
+      address_2:
+        name: IPv6 address 2
+        on_value: *route_ipv6
+      address_3:
+        name: IPv6 address 3
+        on_value: *route_ipv6
+    dns_address:
+      id: eth_dns
+      name: DNS address
+      on_value:
+        - lvgl.label.update:
+            id: lbl_dns
+            text: !lambda |-
+              // ethernet_info joins DNS1 and DNS2; hide the second slot when
+              // the router only hands out one server.
+              std::string out = x;
+              size_t pos;
+              while ((pos = out.find(" 0.0.0.0")) != std::string::npos) {
+                out.erase(pos, 8);
+              }
+              return out.empty() ? std::string("-") : out;
+    mac_address:
+      id: eth_mac
+      name: MAC address
+      on_value:
+        - lvgl.label.update:
+            id: lbl_mac
+            text: !lambda 'return x;'
+
+  - platform: template
+    id: pmu_source
+    name: Power source
+    update_interval: 10s
+    lambda: |-
+      uint8_t s1 = 0;
+      if (!id(axp2101_i2c_device).read_byte(0x00, &s1))
+        return {};
+      const bool vbus_good = (s1 & 0x20) != 0;
+      const bool battery = (s1 & 0x08) != 0;
+      if (!vbus_good)
+        return std::string(battery ? "Battery" : "unknown");
+      // U18 (USB) and U19 (base) feed the same VBUS node, so no register says which is
+      // live; base_self_powered carries the inference and the watcher keeps it current.
+      // Known wrong in one case, left as an edge case: "the base has its own supply"
+      // and "the base is feeding us" are separate facts here. Observed the base plainly
+      // on PoE - not sourcing, link up, lease held - and pulling USB still killed the
+      // board, with PWROFF=0x00 next boot, so it lost VBUS rather than browning out.
+      const char *input = id(base_self_powered) ? "PoE" : "USB";
+      if (battery)
+        return std::string(input) + " + battery";
+      return std::string(input);
+    on_value:
+      - lvgl.label.update:
+          id: lbl_pwr_source
+          text: !lambda 'return x;'
+
+  - platform: template
+    id: pmu_charge
+    name: Battery state
+    update_interval: 10s
+    lambda: |-
+      uint8_t s1 = 0;
+      uint8_t s2 = 0;
+      if (!id(axp2101_i2c_device).read_byte(0x00, &s1) ||
+          !id(axp2101_i2c_device).read_byte(0x01, &s2))
+        return {};
+      if (!(s1 & 0x08))
+        return std::string("not fitted");
+      switch ((s2 >> 5) & 0x03) {
+        case 1:
+          return std::string("charging");
+        case 2:
+          return std::string("discharging");
+        default:
+          return std::string("standby");
+      }
+    on_value:
+      - lvgl.label.update:
+          id: lbl_pwr_batt
+          text: !lambda |-
+            // One row: level, volts and state, so the power-off button fits without scrolling.
+            if (x == "not fitted")
+              return std::string("not fitted");
+            char b[40];
+            if (id(pmu_batt_level).has_state() && id(pmu_vbat).has_state()) {
+              snprintf(b, sizeof(b), "%.0f %% %.2f V %s", id(pmu_batt_level).state,
+                       id(pmu_vbat).state, x.c_str());
+            } else if (id(pmu_vbat).has_state()) {
+              snprintf(b, sizeof(b), "%.2f V %s", id(pmu_vbat).state, x.c_str());
+            } else {
+              return x;
+            }
+            return std::string(b);
+
+  # Link, gateway and netmask have no entity platform, so read the interface
+  # directly. The update entity cannot express "up to date", so poll its state.
+  - platform: template
+    id: fw_status
+    name: Firmware status
+    update_interval: 5s
+    lambda: |-
+      switch (id(fw_update).state) {
+        case update::UPDATE_STATE_AVAILABLE:
+          return id(fw_update).update_info.latest_version;
+        case update::UPDATE_STATE_NO_UPDATE:
+          return std::string("up to date");
+        case update::UPDATE_STATE_INSTALLING:
+          return std::string("installing...");
+        default:
+          return std::string("not checked");
+      }
+    on_value:
+      - lvgl.label.update:
+          id: lbl_fw_available
+          text: !lambda 'return x;'
+
+  # update_interval drives which units appear: seconds below 30s, minutes below 1800s.
+  - platform: uptime
+    id: dev_uptime
+    name: Uptime
+    update_interval: 1s
+    format:
+      separator: " "
+    on_value:
+      - lvgl.label.update:
+          id: lbl_uptime
+          text: !lambda 'return x;'
+
+  - platform: template
+    id: eth_link
+    name: Link
+    update_interval: 5s
+    lambda: |-
+      // is_connected() means "has an IP", which conflates an unplugged cable with a live
+      // link that never got a lease - the distinction this device exists to show.
+      auto *eth = ethernet::global_eth_component;
+      if (eth == nullptr)
+        return std::string("-");
+      auto *nif = eth->get_esp_netif();
+      if (nif == nullptr || !esp_netif_is_netif_up(nif))
+        return std::string("no link");
+      // Abbreviated: the caption takes 116 of the 316 usable pixels, so the value
+      // has ~200 left and "100 Mbit/s / full (no DHCP)" overruns it at
+      // montserrat_16. "100M / full (no DHCP)" is the longest string this can
+      // produce and fits with room to spare.
+      char buf[40];
+      snprintf(buf, sizeof(buf), "%s / %s%s",
+               eth->get_link_speed() == ETH_SPEED_100M ? "100M" : "10M",
+               eth->get_duplex_mode() == ETH_DUPLEX_FULL ? "full" : "half",
+               eth->is_connected() ? "" : " (no DHCP)");
+      return std::string(buf);
+    on_value:
+      - lvgl.label.update:
+          id: lbl_link
+          text: !lambda 'return x;'
+
+  - platform: template
+    id: eth_gateway
+    name: Gateway
+    update_interval: 5s
+    lambda: |-
+      // Empty string, never {} - a template text sensor skips the publish on a missing
+      // optional, leaving the last value on screen after the interface has gone.
+      auto *eth = ethernet::global_eth_component;
+      if (eth == nullptr || eth->get_esp_netif() == nullptr)
+        return std::string();
+      esp_netif_ip_info_t info{};
+      if (esp_netif_get_ip_info(eth->get_esp_netif(), &info) != ESP_OK || info.gw.addr == 0)
+        return std::string();
+      char buf[16];
+      esp_ip4addr_ntoa(&info.gw, buf, sizeof(buf));
+      return std::string(buf);
+    on_value:
+      - lvgl.label.update:
+          id: lbl_gateway
+          text: !lambda 'return x.empty() ? std::string("-") : x;'
+      - lvgl.label.update:
+          id: lbl_ping_gw_heading
+          text: !lambda 'return x.empty() ? std::string("Gateway") : "Gateway - " + x;'
+
+  - platform: template
+    id: eth_netmask
+    name: Netmask
+    update_interval: 5s
+    lambda: |-
+      // Empty string rather than {}, for the same reason as the gateway above.
+      auto *eth = ethernet::global_eth_component;
+      if (eth == nullptr || eth->get_esp_netif() == nullptr)
+        return std::string();
+      esp_netif_ip_info_t info{};
+      if (esp_netif_get_ip_info(eth->get_esp_netif(), &info) != ESP_OK || info.netmask.addr == 0)
+        return std::string();
+      char buf[16];
+      esp_ip4addr_ntoa(&info.netmask, buf, sizeof(buf));
+      return std::string(buf);
+    on_value:
+      - lvgl.label.update:
+          id: lbl_netmask
+          text: !lambda 'return x.empty() ? std::string("-") : x;'
+
+output:
+  # Backlight is DLDO1: REG 0x99 bits 4:0 are 0.5V + 100mV/step, REG 0x90 bit 7 is
+  # its enable. Map 0..1 onto 2.6V..3.3V; below 2.6V the panel is effectively dark.
+  - platform: template
+    id: backlight_output
+    type: float
+    write_action:
+      - lambda: |-
+          const float mv = 2600.0f + state * (3300.0f - 2600.0f);
+          int step = (int) lroundf((mv - 500.0f) / 100.0f);
+          if (step > 28) step = 28;
+          if (step < 0) step = 0;
+          uint8_t reg = 0;
+          if (id(axp2101_i2c_device).read_byte(0x99, &reg)) {
+            id(axp2101_i2c_device).reg(0x99) = (uint8_t) ((reg & 0xE0) | step);
+          }
+
+light:
+  - platform: monochromatic
+    id: lcd_backlight
+    name: Backlight
+    icon: mdi:television
+    entity_category: config
+    output: backlight_output
+    restore_mode: RESTORE_DEFAULT_ON
+    default_transition_length: 250ms
+
+script:
+  # Fades the backlight over 2s before the PMU is told to shut down. Releasing stops
+  # the script mid-fade, so the fade is the countdown.
+  - id: power_off_hold
+    mode: restart
+    then:
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 3%
+          transition_length: 2s
+      - delay: 2100ms
+      - lambda: |-
+          ESP_LOGW("power", "Soft power-off requested");
+          uint8_t cfg = 0;
+          if (!id(axp2101_i2c_device).read_byte(0x10, &cfg)) {
+            ESP_LOGE("power", "could not read REG 0x10; not powering off");
+            return;
+          }
+          ESP_LOGI("power", "REG 0x10 = 0x%02X -> 0x%02X", cfg, cfg | 0x01);
+          id(axp2101_i2c_device).reg(0x10) = (uint8_t) (cfg | 0x01);   // Soft PWROFF
+
+  - id: power_off_cancel
+    mode: restart
+    then:
+      - script.stop: power_off_hold
+      - light.turn_on:
+          id: lcd_backlight
+          brightness: 100%
+          transition_length: 300ms
+
+  # Everything that describes the network, re-read now. Called by the link watcher on
+  # every edge, because a 5-10s poll leaves the screen describing a dead network.
+  - id: refresh_network
+    mode: restart
+    then:
+      - component.update: eth_link
+      - component.update: eth_gateway
+      - component.update: eth_netmask
+      - component.update: pmu_source
+      - if:
+          condition:
+            lambda: 'return network::is_connected();'
+          then:
+            # Auto-ping only while the operator is on the Ping tab (index 1) and
+            # is not already running a continuous ping.
+            - if:
+                condition:
+                  lambda: 'return id(ping_mode) == 0 && lv_tabview_get_tab_act(id(tabs)) == 1;'
+                then:
+                  - script.execute: run_pings
+          else:
+            # Stop any continuous ping and any in-flight batch: a result landing
+            # after the drop would write over the blanks below. Clearing ping_mode
+            # is what makes ping_forever's loop and its guarded writes give up.
+            - lambda: 'id(ping_mode) = 0;'
+            - script.stop: ping_forever
+            - script.stop: run_pings
+            - script.execute: sync_ping_buttons
+            - lambda: |-
+                // Only the got-IP handlers notify the IP-state listener that ethernet_info
+                // publishes from - ETHERNET_EVENT_DISCONNECTED does not - so nothing else ever
+                // clears these. Their on_value handlers blank the labels.
+                id(eth_ip).publish_state("");
+                id(eth_dns).publish_state("");
+            # Fed by unnamed ethernet_info slots that cannot be published to by id.
+            - lvgl.label.update:
+                id: lbl_ipv6_global
+                text: "-"
+            - lvgl.label.update:
+                id: lbl_ipv6_ll
+                text: "-"
+            # The last batch measured a network we are no longer on.
+            - lvgl.label.update:
+                id: lbl_wan_latency
+                text: "-"
+            - lvgl.label.update:
+                id: lbl_wan_loss
+                text: "-"
+            - lvgl.label.update:
+                id: lbl_gw_latency
+                text: "-"
+            - lvgl.label.update:
+                id: lbl_gw_loss
+                text: "-"
+
+  # Continuous ping, one packet per pass so the stats update live rather than
+  # only at the end of a batch. Runs until ping_mode is cleared - by the button,
+  # by the link dropping, or by the target string going away.
+  - id: ping_forever
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: |-
+              if (id(ping_mode) == 0 || !network::is_connected())
+                return false;
+              const std::string &t = id(ping_mode) == 1 ? id(wan_target).state
+                                                         : id(eth_gateway).state;
+              return !t.empty();
+          then:
+            - ping.ping:
+                id: pinger
+                count: 1
+                ip_address: !lambda |-
+                  return id(ping_mode) == 1 ? id(wan_target).state : id(eth_gateway).state;
+            # Re-checked because the pass takes about a second: if the link
+            # dropped meanwhile, refresh_network has already blanked these labels
+            # and this result describes a network we have left.
+            - if:
+                condition:
+                  lambda: 'return id(ping_mode) != 0;'
+                then:
+                  # One lambda, because lvgl.label.update needs a compile-time
+                  # widget id - it cannot be templated - and the target row is
+                  # only known at runtime. Drive the LVGL objects directly.
+                  - lambda: |-
+                      const auto &r = id(pinger)->get_last_result();
+                      id(pf_sent) += r.requested;
+                      id(pf_recv) += r.received;
+                      id(pf_total_ms) += r.latency_ms * r.received;
+
+                      char lat[16];
+                      if (id(pf_recv) == 0)
+                        snprintf(lat, sizeof(lat), "- ms");
+                      else
+                        snprintf(lat, sizeof(lat), "%u ms", (unsigned) (id(pf_total_ms) / id(pf_recv)));
+
+                      const uint32_t sent = id(pf_sent), recv = id(pf_recv);
+                      const float loss = sent == 0 ? 0.0f : 100.0f * (sent - recv) / sent;
+                      char ls[28];
+                      snprintf(ls, sizeof(ls), "%.0f %% (%u/%u)", loss, (unsigned) recv, (unsigned) sent);
+
+                      lv_label_set_text(id(ping_mode) == 1 ? id(lbl_wan_latency) : id(lbl_gw_latency), lat);
+                      lv_label_set_text(id(ping_mode) == 1 ? id(lbl_wan_loss) : id(lbl_gw_loss), ls);
+            # Paces the loop, and a backstop: an address the pinger rejects
+            # returns at once, which would otherwise spin flat out.
+            - delay: 500ms
+      - lambda: 'id(ping_mode) = 0;'
+      - script.execute: sync_ping_buttons
+
+  # One place that keeps both buttons in step with ping_mode.
+  - id: sync_ping_buttons
+    mode: restart
+    then:
+      - lvgl.label.update:
+          id: lbl_btn_wan
+          text: !lambda 'return std::string(id(ping_mode) == 1 ? "Stop" : "Ping");'
+      - lvgl.label.update:
+          id: lbl_btn_gw
+          text: !lambda 'return std::string(id(ping_mode) == 2 ? "Stop" : "Ping");'
+
+  # A one-shot 4-count to both targets, run when the Ping tab is opened. Uses the
+  # batch's own result rather than the running totals the continuous ping keeps.
+  # `single`, not `restart`: a link flap must not tear down a batch in flight.
+  - id: run_pings
+    mode: single
+    then:
+      # Guarded even though callers check: the 30s poll's first run is spread randomly
+      # and can fire before DHCP. A down interface reports a misleading 0% loss.
+      - if:
+          condition:
+            lambda: 'return network::is_connected();'
+          then:
+            - if:
+                condition:
+                  lambda: 'return !id(wan_target).state.empty();'
+                then:
+                  - ping.ping:
+                      id: pinger
+                      ip_address: !lambda 'return id(wan_target).state;'
+                      count: 4
+                  # Inside the guard: the labels read the pinger's last result.
+                  - lvgl.label.update:
+                      id: lbl_wan_latency
+                      text: !lambda |-
+                        const auto &r = id(pinger)->get_last_result();
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "%u ms", (unsigned) r.latency_ms);
+                        return std::string(buf);
+                  - lvgl.label.update:
+                      id: lbl_wan_loss
+                      text: !lambda |-
+                        const auto &r = id(pinger)->get_last_result();
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "%.0f %% (%u/%u)", r.loss, (unsigned) r.received,
+                                 (unsigned) r.requested);
+                        return std::string(buf);
+            # The gateway is only known once the interface has an address.
+            - if:
+                condition:
+                  lambda: 'return !id(eth_gateway).state.empty();'
+                then:
+                  - ping.ping:
+                      id: pinger
+                      ip_address: !lambda 'return id(eth_gateway).state;'
+                      count: 4
+                  - lvgl.label.update:
+                      id: lbl_gw_latency
+                      text: !lambda |-
+                        const auto &r = id(pinger)->get_last_result();
+                        char buf[16];
+                        snprintf(buf, sizeof(buf), "%u ms", (unsigned) r.latency_ms);
+                        return std::string(buf);
+                  - lvgl.label.update:
+                      id: lbl_gw_loss
+                      text: !lambda |-
+                        const auto &r = id(pinger)->get_last_result();
+                        char buf[24];
+                        snprintf(buf, sizeof(buf), "%.0f %% (%u/%u)", r.loss, (unsigned) r.received,
+                                 (unsigned) r.requested);
+                        return std::string(buf);
+
+switch:
+  # Bound straight to the widget, so it is already optimistic. Suspending the poller
+  # is what actually stops the update entity checking.
+  - platform: lvgl
+    id: update_check_enabled
+    widget: sw_update_check
+    name: Update checking
+    entity_category: config
+    restore_mode: RESTORE_DEFAULT_ON
+    on_turn_on:
+      - component.resume: fw_update
+    on_turn_off:
+      - component.suspend: fw_update
+
+text:
+  - platform: template
+    id: wan_target
+    name: Internet ping target
+    entity_category: config
+    icon: mdi:target
+    mode: text
+    optimistic: true
+    restore_value: true
+    initial_value: "1.1.1.1"
+    min_length: 7
+    max_length: 15
+    # Dotted-quad, each octet 0-255. Enforced by the frontend; the on-device set
+    # is unvalidated, so the ping guards still treat the string as untrusted.
+    pattern: '(25[0-5]|2[0-4]\d|[01]?\d?\d)\.(25[0-5]|2[0-4]\d|[01]?\d?\d)\.(25[0-5]|2[0-4]\d|[01]?\d?\d)\.(25[0-5]|2[0-4]\d|[01]?\d?\d)'
+    on_value:
+      - lvgl.label.update:
+          id: lbl_ping_wan_heading
+          text: !lambda 'return x.empty() ? std::string("Internet") : "Internet - " + x;'
+
+binary_sensor:
+  - platform: template
+    id: base_powered
+    name: Base self-powered
+    entity_category: diagnostic
+    lambda: 'return id(base_self_powered);'
+    on_state:
+      - lvgl.label.update:
+          id: lbl_pwr_base
+          text: !lambda |-
+            return std::string(x ? "own supply (PoE)" : "fed from CoreS3");
+
+sensor:
+  # AXP2101 telemetry. The ADC registers are 14-bit across two bytes, so read
+  # them in one transaction rather than two byte reads that could tear.
+  - platform: template
+    id: pmu_vbus
+    name: VBUS voltage
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      uint8_t buf[2];
+      if (id(axp2101_i2c_device).read_register(0x38, buf, 2) != i2c::ERROR_OK)
+        return {};
+      return (float) ((((buf[0] & 0x3F) << 8) | buf[1])) / 1000.0f;
+    on_value:
+      - lvgl.label.update:
+          id: lbl_pwr_vbus
+          text: !lambda |-
+            char b[16];
+            snprintf(b, sizeof(b), "%.2f V", x);
+            return std::string(b);
+
+  - platform: template
+    id: pmu_vbat
+    name: Battery voltage
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      // With no cell fitted the ADC floats, so gate on the battery-present bit.
+      uint8_t s1 = 0;
+      if (!id(axp2101_i2c_device).read_byte(0x00, &s1) || !(s1 & 0x08))
+        return {};
+      uint8_t buf[2];
+      if (id(axp2101_i2c_device).read_register(0x34, buf, 2) != i2c::ERROR_OK)
+        return {};
+      return (float) ((((buf[0] & 0x3F) << 8) | buf[1])) / 1000.0f;
+
+  - platform: template
+    id: pmu_vsys
+    name: System voltage
+    unit_of_measurement: V
+    device_class: voltage
+    accuracy_decimals: 2
+    update_interval: 10s
+    lambda: |-
+      uint8_t buf[2];
+      if (id(axp2101_i2c_device).read_register(0x3A, buf, 2) != i2c::ERROR_OK)
+        return {};
+      return (float) ((((buf[0] & 0x3F) << 8) | buf[1])) / 1000.0f;
+    on_value:
+      - lvgl.label.update:
+          id: lbl_pwr_vsys
+          text: !lambda |-
+            char b[16];
+            snprintf(b, sizeof(b), "%.2f V", x);
+            return std::string(b);
+
+  - platform: template
+    id: pmu_batt_level
+    name: Battery level
+    unit_of_measurement: "%"
+    device_class: battery
+    accuracy_decimals: 0
+    update_interval: 10s
+    lambda: |-
+      uint8_t s1 = 0;
+      // The fuel gauge reads 0xFF when no cell is fitted.
+      if (!id(axp2101_i2c_device).read_byte(0x00, &s1) || !(s1 & 0x08))
+        return {};
+      uint8_t pct = 0;
+      if (!id(axp2101_i2c_device).read_byte(0xA4, &pct) || pct > 100)
+        return {};
+      return (float) pct;
+
+interval:
+  # Link watcher. `ethernet:` has on_connect/on_disconnect but both are raised around
+  # the lease: on_disconnect only fires from CONNECTED, so a cable pulled before
+  # DHCP finished - the case this device exists to show - raises nothing at all.
+  - interval: 250ms
+    then:
+      - lambda: |-
+          auto *eth = ethernet::global_eth_component;
+          bool up = false;
+          if (eth != nullptr) {
+            auto *nif = eth->get_esp_netif();
+            up = nif != nullptr && esp_netif_is_netif_up(nif);
+          }
+          const bool lease = network::is_connected();
+
+          // PoE arrives on the same RJ45 as the link, and while we are not sourcing the base
+          // has no other supply - so a live link proves it feeds itself and a dead one
+          // proves it does not. Blind spot: an injector that keeps feeding the base while
+          // the switch behind it drops the link reads as USB.
+          const bool self = !id(power_the_base) && up;
+
+          // The derived value is part of the edge test: on_boot seeds it from the sourcing
+          // decision alone, before any link exists, so watching it corrects that within
+          // 250ms rather than leaving it to the 15s takeover.
+          if (up == id(link_was_up) && lease == id(lease_was_held) &&
+              self == id(base_self_powered))
+            return;
+          id(link_was_up) = up;
+          id(lease_was_held) = lease;
+          id(base_self_powered) = self;
+          ESP_LOGI("net", "Link %s, lease %s, sourcing %s -> base %s",
+                   up ? "up" : "down", lease ? "held" : "none",
+                   id(power_the_base) ? "yes" : "no",
+                   id(base_self_powered) ? "own supply (PoE)" : "fed from CoreS3");
+          id(refresh_network).execute();
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+lvgl:
+  displays: [lcd]
+  touchscreens: [touch]
+  buffer_size: 25%
+  default_font: montserrat_16
+  bg_color: 0x0D1117
+  text_color: 0xE6EDF3
+  theme:
+    dark_mode: true
+  style_definitions:
+    - id: row_style
+      width: 100%
+      height: 30
+      pad_all: 0
+      border_width: 0
+      bg_opa: TRANSP
+    # Controls need room for their own padding; a 26px button in a 26px row scrolls.
+    - id: control_row_style
+      width: 100%
+      height: 40
+      pad_all: 0
+      pad_column: 8
+      border_width: 0
+      bg_opa: TRANSP
+    - id: caption_style
+      width: 116
+      text_color: 0x8B949E
+    - id: value_style
+      text_color: 0xE6EDF3
+    - id: heading_style
+      width: 100%
+      height: 24
+      text_color: 0x58A6FF
+      pad_top: 2
+
+  widgets:
+    - tabview:
+        id: tabs
+        position: top
+        size: 36
+        # Ping 4 times to both targets when the Ping tab (index 1) is opened,
+        # unless a continuous ping is already running.
+        on_value:
+          - if:
+              condition:
+                lambda: |-
+                  return id(ping_mode) == 0 && network::is_connected() &&
+                         lv_tabview_get_tab_act(id(tabs)) == 1;
+              then:
+                - script.execute: run_pings
+        content_style:
+          bg_color: 0x0D1117
+          bg_opa: COVER
+          border_width: 0
+          pad_all: 0
+        tab_style:
+          bg_color: 0x161B22
+          items:
+            bg_color: 0x161B22
+            text_color: 0x8B949E
+            text_font: montserrat_16
+            checked:
+              text_color: 0x58A6FF
+              bg_color: 0x0D1117
+        tabs:
+          # -------------------------------------------------- Network
+          - name: Network
+            id: tab_network
+            bg_color: 0x0D1117
+            bg_opa: COVER
+            pad_all: 2
+            scrollbar_mode: "OFF"
+            # Link 30 + selector 40 + pane 124 + pads 6 = 200 of 204. Only one pane is laid
+            # out at a time; LVGL's flex layout skips hidden objects.
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 1
+            widgets:
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Link", styles: caption_style}
+                    - label: {id: lbl_link, text: "-", styles: value_style, flex_grow: 1}
+              # Buttons rather than a nested tabview: a tabview's content container carries
+              # LV_OBJ_FLAG_SCROLLABLE, which content_style cannot reach from YAML.
+              - obj:
+                  styles: control_row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - button:
+                        id: btn_ipv4
+                        width: 100
+                        height: 32
+                        checkable: true
+                        state: {checked: true}
+                        widgets:
+                          - label: {text: "IPv4", align: CENTER}
+                        on_click:
+                          - lvgl.widget.show: box_ipv4
+                          - lvgl.widget.hide: box_ipv6
+                          - lvgl.widget.update:
+                              id: btn_ipv4
+                              state: {checked: true}
+                          - lvgl.widget.update:
+                              id: btn_ipv6
+                              state: {checked: false}
+                    - button:
+                        id: btn_ipv6
+                        width: 100
+                        height: 32
+                        checkable: true
+                        widgets:
+                          - label: {text: "IPv6", align: CENTER}
+                        on_click:
+                          - lvgl.widget.show: box_ipv6
+                          - lvgl.widget.hide: box_ipv4
+                          - lvgl.widget.update:
+                              id: btn_ipv6
+                              state: {checked: true}
+                          - lvgl.widget.update:
+                              id: btn_ipv4
+                              state: {checked: false}
+
+              - obj:
+                  id: box_ipv4
+                  width: 100%
+                  height: 124
+                  pad_all: 0
+                  border_width: 0
+                  bg_opa: TRANSP
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: COLUMN, pad_row: 1}
+                  widgets:
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "Address", styles: caption_style}
+                          - label: {id: lbl_ip, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "Netmask", styles: caption_style}
+                          - label: {id: lbl_netmask, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "Gateway", styles: caption_style}
+                          - label: {id: lbl_gateway, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "DNS", styles: caption_style}
+                          - label: {id: lbl_dns, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+
+              - obj:
+                  id: box_ipv6
+                  hidden: true
+                  width: 100%
+                  height: 124
+                  pad_all: 0
+                  border_width: 0
+                  bg_opa: TRANSP
+                  scrollbar_mode: "OFF"
+                  layout: {type: flex, flex_flow: COLUMN, pad_row: 1}
+                  widgets:
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "Global", styles: caption_style}
+                          - label: {id: lbl_ipv6_global, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+                    - obj:
+                        styles: row_style
+                        layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                        widgets:
+                          - label: {text: "Link-local", styles: caption_style}
+                          - label: {id: lbl_ipv6_ll, text: "-", styles: value_style, flex_grow: 1, long_mode: SCROLL}
+
+          # -------------------------------------------------- Ping
+          - name: Ping
+            id: tab_ping
+            bg_color: 0x0D1117
+            bg_opa: COVER
+            pad_all: 2
+            scrollbar_mode: "OFF"
+            # 2 heading+button rows x 32 + 4 rows x 30 = 184, pad_row 1x5 = 5,
+            # pad 2x2 = 4 -> 193 of 204.
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 1
+            widgets:
+              - obj:
+                  styles: row_style
+                  height: 32
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {id: lbl_ping_wan_heading, text: "Internet", text_color: 0x58A6FF, flex_grow: 1}
+                    - button:
+                        id: btn_ping_wan
+                        width: 72
+                        height: 28
+                        widgets:
+                          - label: {id: lbl_btn_wan, text: "Ping", align: CENTER}
+                        on_click:
+                          - lambda: |-
+                              if (id(ping_mode) == 1) {
+                                id(ping_mode) = 0;
+                              } else {
+                                id(ping_mode) = 1;
+                                id(pf_sent) = 0; id(pf_recv) = 0; id(pf_total_ms) = 0;
+                              }
+                          - script.execute: sync_ping_buttons
+                          - if:
+                              condition:
+                                lambda: 'return id(ping_mode) == 1;'
+                              then:
+                                - lvgl.label.update: {id: lbl_wan_latency, text: "..."}
+                                - lvgl.label.update: {id: lbl_wan_loss, text: "..."}
+                                - script.execute: ping_forever
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Latency", styles: caption_style}
+                    - label: {id: lbl_wan_latency, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Loss", styles: caption_style}
+                    - label: {id: lbl_wan_loss, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  height: 32
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {id: lbl_ping_gw_heading, text: "Gateway", text_color: 0x58A6FF, flex_grow: 1}
+                    - button:
+                        id: btn_ping_gw
+                        width: 72
+                        height: 28
+                        widgets:
+                          - label: {id: lbl_btn_gw, text: "Ping", align: CENTER}
+                        on_click:
+                          - lambda: |-
+                              if (id(ping_mode) == 2) {
+                                id(ping_mode) = 0;
+                              } else {
+                                id(ping_mode) = 2;
+                                id(pf_sent) = 0; id(pf_recv) = 0; id(pf_total_ms) = 0;
+                              }
+                          - script.execute: sync_ping_buttons
+                          - if:
+                              condition:
+                                lambda: 'return id(ping_mode) == 2;'
+                              then:
+                                - lvgl.label.update: {id: lbl_gw_latency, text: "..."}
+                                - lvgl.label.update: {id: lbl_gw_loss, text: "..."}
+                                - script.execute: ping_forever
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Latency", styles: caption_style}
+                    - label: {id: lbl_gw_latency, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Loss", styles: caption_style}
+                    - label: {id: lbl_gw_loss, text: "-", styles: value_style, flex_grow: 1}
+
+          # -------------------------------------------------- Power
+          - name: Power
+            id: tab_power
+            bg_color: 0x0D1117
+            bg_opa: COVER
+            pad_all: 2
+            scrollbar_mode: "OFF"
+            # 5 rows x 30 + 36 button row + pads 9 = 195 of the 204 below the tab bar.
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 1
+            widgets:
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Source", styles: caption_style}
+                    - label: {id: lbl_pwr_source, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Base", styles: caption_style}
+                    - label: {id: lbl_pwr_base, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "VBUS", styles: caption_style}
+                    - label: {id: lbl_pwr_vbus, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "System", styles: caption_style}
+                    - label: {id: lbl_pwr_vsys, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Battery", styles: caption_style}
+                    - label: {id: lbl_pwr_batt, text: "-", styles: value_style, flex_grow: 1}
+              # Long press, not a tap: a stray touch here needs the physical button to undo.
+              - obj:
+                  styles: control_row_style
+                  height: 36
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_main: END
+                    flex_align_cross: CENTER
+                  widgets:
+                    - button:
+                        id: btn_power_off
+                        width: 190
+                        height: 32
+                        bg_color: 0x3D1418
+                        widgets:
+                          - label: {text: "Hold to power off", align: CENTER}
+                        # press/release rather than on_long_press: gives a visible countdown.
+                        on_press:
+                          - script.execute: power_off_hold
+                        on_release:
+                          - script.execute: power_off_cancel
+                        on_press_lost:
+                          - script.execute: power_off_cancel
+
+          # -------------------------------------------------- System (room to grow)
+          - name: System
+            id: tab_system
+            bg_color: 0x0D1117
+            bg_opa: COVER
+            pad_all: 2
+            scrollbar_mode: "OFF"
+            # scrollbar_mode only hides the bar; clearing the scrollable flag is what stops
+            # LVGL treating this as a scroll container. It was overflowing by ~9px.
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: COLUMN
+              pad_row: 1
+            widgets:
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Device", styles: caption_style}
+                    - label: {text: "Network Toolbox", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Uptime", styles: caption_style}
+                    - label: {id: lbl_uptime, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: control_row_style
+                  height: 36
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Updates", styles: caption_style}
+                    - switch:
+                        id: sw_update_check
+                        width: 56
+                        height: 28
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "MAC", styles: caption_style}
+                    - label: {id: lbl_mac, text: "-", styles: value_style, flex_grow: 1}
+              - obj:
+                  styles: row_style
+                  layout: {type: flex, flex_flow: ROW, flex_align_cross: CENTER}
+                  widgets:
+                    - label: {text: "Firmware", styles: caption_style}
+                    - label: {id: lbl_fw_available, text: "-", styles: value_style, flex_grow: 1}
+              # Buttons get their own row; two 34px controls will not fit in a text row.
+              - obj:
+                  styles: control_row_style
+                  height: 36
+                  layout:
+                    type: flex
+                    flex_flow: ROW
+                    flex_align_main: END
+                    flex_align_cross: CENTER
+                  widgets:
+                    # Fetch the manifest. Without this the entity never looks.
+                    - button:
+                        id: btn_fw_check
+                        width: 88
+                        height: 32
+                        widgets:
+                          - label: {text: "Check", align: CENTER}
+                        on_click:
+                          - component.update: fw_update
+                    # Does nothing unless the entity is in the AVAILABLE state.
+                    - button:
+                        id: btn_fw_install
+                        width: 88
+                        height: 32
+                        widgets:
+                          - label: {text: "Install", align: CENTER}
+                        on_click:
+                          - update.perform:
+                              id: fw_update

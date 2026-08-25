@@ -1,4 +1,4 @@
 # CHANGEME: Set these variable to your liking
-title: ESPHome Project Template
-description: Powered by ESPHome and ESP Web Tools
+title: Network Toolbox
+description: ESPHome firmware for handheld network test gear
 theme: jekyll-theme-slate
